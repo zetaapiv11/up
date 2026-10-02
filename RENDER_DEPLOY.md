@@ -1,64 +1,79 @@
-# Deploy Zeechei Bot ke Render
+# Render Blueprint: always-on bot and dashboard
 
-## 1. Upload project
+`render.yaml` manages the existing **zeechei-v4-dashboard** service. It uses a paid
+`0.5c-512mb` compute plan (0.5 CPU / 512 MB, listed at **US$7/month** on 2026-10-02,
+excluding other usage and taxes), one instance, and the Singapore region.
 
-Extract ZIP ini, lalu upload **isi foldernya** ke repository GitHub baru. Pastikan
-`index.js`, `package.json`, dan `render.yaml` berada di root repository.
+A Blueprint is infrastructure configuration, not a compute/service type. This
+application keeps the Discord gateway and dashboard in one Node process, so the
+Blueprint uses `type: web`. Paid Web Services do not have Free's idle spin-down.
+Splitting this implementation into a worker and a separate web process would need
+shared command transport and sessions that are not implemented yet.
 
-Di Render pilih **New → Blueprint** lalu pilih repository tersebut. Jika tidak
-memakai Blueprint, buat **Web Service** dengan konfigurasi:
+References: [Blueprints](https://render.com/docs/infrastructure-as-code),
+[compute pricing](https://render.com/pricing), [Free limits](https://render.com/docs/free).
 
-- Runtime: `Node`
-- Build Command: `npm install`
-- Start Command: `node index.js`
-- Instance: `Free` atau instance yang selalu aktif
+## Apply the prepared Blueprint
 
-## 2. Environment Variables di Render
+1. Open Render in **zeta's workspace** and choose **New + → Blueprint**.
+2. Select repository `ijalxiaomi65-source/up` and branch
+   `coderabbit/upgrade-zeechei-v4-music-dashboard/7c79d5d0`.
+3. Use Blueprint Path `render.yaml`. Prefer **Auto Sync: No** while configuring
+   database migration and deployment sequencing.
+4. Review the plan: it should adopt/update the existing service
+   `zeechei-v4-dashboard` (`srv-davm8uad0e5s738hudog`), changing its compute plan
+   from Free to `0.5c-512mb`. Confirm the displayed price before **Deploy Blueprint**.
+   If it proposes an additional service, check the workspace and exact name first.
+5. A source-file push alone does not attach the service to a Blueprint or change
+   the live compute plan. The Blueprint must be created/synced in Render.
 
-Buka service Render → **Environment → Add Environment Variable**:
+The connected Render MCP currently supports creating services and triggering
+service deployments, but not creating/syncing Blueprints or changing compute
+plans. Those operations need the Dashboard or an authenticated REST API route.
 
-| Variable | Wajib | Isi |
-|---|---:|---|
-| `DISCORD_TOKEN` | Ya | Token bot dari Discord Developer Portal → Bot → Reset Token |
-| `CLIENT_ID` | Ya | Application ID dari Discord Developer Portal → General Information |
-| `RAPIDAPI_KEY` | Ya untuk link YouTube | API key RapidAPI dari akun RapidAPI yang berlangganan API YouTube MP3 |
-| `OWNER_IDS` | Disarankan | Discord User ID pemilik bot; jika lebih dari satu, pisahkan dengan koma |
-| `GUILD_ID` | Opsional | ID server testing agar slash command terdaftar lebih cepat; kosongkan untuk global |
-| `YT_COOKIES` | Opsional | Isi `cookies.txt` format Netscape jika ingin memberi jalur tambahan untuk yt-dlp |
+## Environment and first setup
 
-Jangan mengisi token atau key di `settings.js`, GitHub, README, atau chat.
+The existing service's `SETUP_MODE=true` is retained by `sync: false`. Secrets and
+node connection values are also preserved; `SESSION_SECRET` is generated only if
+it does not already exist. No credentials are stored in the Blueprint.
 
-## 3. Pengaturan Discord Developer Portal
+- Fill `DISCORD_TOKEN`, `CLIENT_ID`, `OWNER_IDS`, and `DISCORD_CLIENT_SECRET`.
+- Fill `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
+- Fill `LAVALINK_HOST` and `LAVALINK_PASSWORD`; verify `LAVALINK_PORT` and
+  `LAVALINK_SECURE` match your external node. Current setup defaults are 443/true.
+- Register `https://zeechei-v4-dashboard.onrender.com/api/auth/callback` in Discord.
+- Enable Server Members and Message Content intents in Discord Developer Portal.
 
-Aktifkan:
+Before starting the real bot:
 
-- **Server Members Intent**
-- **Message Content Intent**
+1. Back up the latest old bot data; stop the old bot before migration/cutover.
+2. Apply `database/supabase/schema.sql` and `runtime.sql` to Supabase.
+3. Run `npm run db:migrate`, then `npm run db:validate` against that database.
+4. Set `SETUP_MODE=false` in Render Environment, then deploy.
+5. Confirm `/ready`, Discord commands, OAuth, settings save and audio playback.
 
-Saat mengundang bot, gunakan scope `bot` dan `applications.commands`.
-Bot membutuhkan izin minimal **View Channel**, **Send Messages**, **Connect**,
-dan **Speak**. Untuk konfigurasi penuh, izin **Manage Roles** dan izin
-moderasi terkait juga diperlukan.
+The initial Blueprint uses `/` as its HTTP health check so the requested public
+setup page stays deployable before credentials are supplied. During setup,
+`/health`, `/api/health` and `/ready` return 503 and the bot is not running.
+After completing integration acceptance, change `healthCheckPath` to `/ready`.
+A reachable setup page never proves that Discord, Supabase or Lavalink is ready.
 
-## 4. Setelah deploy
+## Deployment sequencing
 
-1. Buka **Logs** di Render dan pastikan muncul `sudah online`.
-2. Di Discord, join voice channel.
-3. Jalankan:
+The app builds with `npm ci --omit=dev` and starts with `npm start`, using Node
+24.14.1. Render supplies `PORT`; the app binds `0.0.0.0`. Supabase and Lavalink are
+external. No persistent disk is needed for the Supabase runtime.
 
-   `/play query:<link YouTube>`
+`numInstances: 1` and `autoDeployTrigger: off` are deliberate: the compatibility
+runtime permits only one active writer. With `RUNTIME_HANDOFF=true` and Render's
+health check at `/`, a replacement waiting for the lease serves process liveness
+so Render can retire the old process. `/ready` and all application APIs remain
+503 during this handover. The new bot waits for release/expiry (up to 90 seconds)
+and loads the latest database snapshot before starting Discord. It never steals
+an active lease. The wait is bounded to three minutes; other database failures
+still stop startup immediately. This can briefly interrupt dashboard availability.
+Do not enable replicas. With handover disabled, stop the old process first.
 
-Untuk link YouTube, bot memakai RapidAPI sebagai jalur audio utama lalu
-memutar hasilnya melalui FFmpeg. Jika RapidAPI kehabisan kuota atau gagal,
-bot masih mencoba jalur cadangan yang tersedia.
-
-## 5. Catatan Render Free
-
-Web Service Free dapat tidur jika tidak menerima trafik HTTP. Bot Discord bisa
-ikut offline ketika service tidur. `utils/keepAlive.js` sudah membuka port
-health check, tetapi Render tetap dapat melakukan spin-down. Untuk bot 24/7,
-gunakan instance selalu aktif atau ping endpoint health check secara berkala.
-
-Database JSON lokal tidak persisten saat redeploy. Data konfigurasi yang penting
-sebaiknya dicatat ulang atau dipindahkan ke penyimpanan persisten sebelum
-deployment production.
+This avoids idle sleep, but it is not a guarantee of uninterrupted availability:
+maintenance, manual deploys, configuration failures and provider outages still
+need handling. Monitor actual bot readiness separately from the public web page.
